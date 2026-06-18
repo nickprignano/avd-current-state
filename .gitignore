@@ -1,0 +1,18 @@
+# Evidence package outputs
+avd-current-state-*/
+*.zip
+
+# PowerShell module cache
+PSModules/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
