@@ -1,6 +1,13 @@
 # Evidence package outputs
 avd-current-state-*/
+avd-validation-*/
 *.zip
+
+# Local validator config -- holds real subscription IDs and resource names.
+# The committed template is avd-validation.config.example.json.
+avd-validation.config.json
+avd-validation.config.*.json
+!avd-validation.config.example.json
 
 # PowerShell module cache
 PSModules/
