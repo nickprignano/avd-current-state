@@ -1,0 +1,35 @@
+{
+  "_comment": "Example config for avd_deployment_validator.ps1. Copy, edit, then run: .\\avd_deployment_validator.ps1 -ConfigPath .\\avd-validation.config.json  --  any key can be overridden on the command line; explicit parameters always win. Remove keys you do not use; their checks report SKIP.",
+
+  "Mode": "Both",
+
+  "SubscriptionName": "Sub-AVD-Prod",
+
+  "Location": "eastus2",
+  "MetadataLocation": "eastus2",
+  "ResourceGroupName": "rg-avd-prod",
+
+  "VirtualNetworkName": "vnet-avd",
+  "VirtualNetworkResourceGroup": "rg-network-hub",
+  "SubnetName": "snet-avd-hosts",
+
+  "SessionHostCount": 20,
+  "SessionHostVmSize": "Standard_D4ads_v5",
+
+  "HostPoolName": "hp-avd-prod",
+  "WorkspaceName": "ws-avd-prod",
+  "ApplicationGroupName": "ag-avd-desktop",
+
+  "StorageAccountName": "stavdfslogix01",
+  "StorageAccountResourceGroup": "rg-avd-prod",
+  "FileShareName": "profiles",
+
+  "LogAnalyticsWorkspaceName": "law-avd-prod",
+  "LogAnalyticsResourceGroup": "rg-avd-prod",
+
+  "ImageId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-images/providers/Microsoft.Compute/galleries/gal_avd/images/win11-24h2-avd-m365/versions/1.0.0",
+  "DomainName": "contoso.com",
+
+  "MaxHeartbeatAgeMinutes": 30,
+  "IpBufferPercent": 20
+}
