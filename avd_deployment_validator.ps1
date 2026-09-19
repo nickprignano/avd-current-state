@@ -531,12 +531,9 @@ $requiredModules = @(
 # Optional modules power individual checks. When one is missing the dependent checks
 # report SKIP instead of failing the run.
 $optionalModules = @(
-    'Az.OperationalInsights',
-    'Az.Monitor',
-    'Az.RecoveryServices',
-    'Az.KeyVault',
-    'Az.PrivateDns',
-    'Az.PolicyInsights'
+    'Az.OperationalInsights',   # Get-AzOperationalInsightsWorkspace
+    'Az.Monitor',               # Get-AzDiagnosticSetting
+    'Az.RecoveryServices'       # Get-AzRecoveryServicesVault / -BackupItem
 )
 
 foreach ($moduleName in $requiredModules) {
