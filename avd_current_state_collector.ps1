@@ -183,6 +183,32 @@ function Sanitize-FolderName {
     $Name -replace '[^\w\-\.\s]', '_' -replace '\s+', '_'
 }
 
+function Get-PropValue {
+    <#
+    .SYNOPSIS
+        StrictMode-safe property read that tolerates Az output shape changes.
+    .DESCRIPTION
+        Az.Resources v8 flattened Get-AzPolicyAssignment output, moving Properties.X
+        up to X. Under Set-StrictMode -Version Latest a missing property throws rather
+        than returning null, so a bare $_.Properties.DisplayName kills the whole dataset
+        via Safe-Collect. Paths are tried in order and the first that resolves wins,
+        so one expression works across Az versions.
+    #>
+    param([object]$InputObject, [string[]]$Paths, $Default = $null)
+    foreach ($path in $Paths) {
+        $current = $InputObject
+        $resolved = $true
+        foreach ($segment in ($path -split '\.')) {
+            if ($null -eq $current) { $resolved = $false; break }
+            $prop = $current.PSObject.Properties[$segment]
+            if ($null -eq $prop -or $null -eq $prop.Value) { $resolved = $false; break }
+            $current = $prop.Value
+        }
+        if ($resolved) { return $current }
+    }
+    return $Default
+}
+
 # endregion
 
 # ─────────────────────────────────────────────
@@ -481,7 +507,7 @@ foreach ($sub in $targetSubs) {
     $recVaults = Safe-Collect 'RecoveryServicesVaults' {
         Get-AzRecoveryServicesVault | Select-Object Name, ResourceGroupName, Location,
             @{N='Type';E={ $_.Type }},
-            @{N='ProvisioningState';E={ $_.Properties.ProvisioningState }},
+            @{N='ProvisioningState';E={ Get-PropValue $_ @('Properties.ProvisioningState','ProvisioningState') '' }},
             @{N='Tags';E={ ($_.Tags | ConvertTo-Json -Compress -WarningAction SilentlyContinue) }},
             ID
     }
@@ -502,12 +528,12 @@ foreach ($sub in $targetSubs) {
     # ── Policy Assignments ──
     $policyAssignments = Safe-Collect 'PolicyAssignments' {
         Get-AzPolicyAssignment -ErrorAction SilentlyContinue |
-            Select-Object @{N='DisplayName';E={ $_.Properties.DisplayName }},
-                @{N='PolicyDefinitionId';E={ $_.Properties.PolicyDefinitionId }},
-                @{N='Scope';E={ $_.Properties.Scope }},
-                @{N='EnforcementMode';E={ $_.Properties.EnforcementMode }},
+            Select-Object @{N='DisplayName';E={ Get-PropValue $_ @('DisplayName','Properties.DisplayName') '' }},
+                @{N='PolicyDefinitionId';E={ Get-PropValue $_ @('PolicyDefinitionId','Properties.PolicyDefinitionId') '' }},
+                @{N='Scope';E={ Get-PropValue $_ @('Scope','Properties.Scope') '' }},
+                @{N='EnforcementMode';E={ Get-PropValue $_ @('EnforcementMode','Properties.EnforcementMode') '' }},
                 @{N='AssignmentName';E={ $_.Name }},
-                ResourceId
+                @{N='ResourceId';E={ Get-PropValue $_ @('Id','ResourceId') '' }}
     }
     $subCounts['PolicyAssignments'] = (Export-Dataset -SubDir $subDir -Name 'policy-assignments' -Data $policyAssignments)
 
