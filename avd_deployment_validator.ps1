@@ -282,6 +282,36 @@ function Get-FirstProp {
     return $Default
 }
 
+function Get-PolicyParameterValue {
+    <#
+    .SYNOPSIS
+        Reads a named policy assignment parameter, tolerating either envelope.
+    .DESCRIPTION
+        ARM stores assignment parameters as {"name":{"value":X}}. Newer Az versions may
+        surface the value directly as {"name":X}. Both are handled, and when the
+        structured Parameter member is absent the raw JSON form is parsed instead.
+
+        Returns $null only when the parameter genuinely cannot be determined. The caller
+        reports that rather than skipping, because a policy check that silently does
+        nothing reads like a pass.
+    #>
+    param([object]$Assignment, [string]$ParameterName)
+
+    $parameters = Get-FirstProp $Assignment @('Parameter', 'Parameters', 'Properties.Parameters') $null
+    $entry = Get-Prop $parameters $ParameterName
+
+    if ($null -eq $entry) {
+        $raw = Get-FirstProp $Assignment @('ParameterRaw', 'Properties.ParametersRaw', 'ParametersRaw') ''
+        if ([string]::IsNullOrWhiteSpace("$raw")) { return $null }
+        try { $entry = Get-Prop ("$raw" | ConvertFrom-Json) $ParameterName } catch { return $null }
+        if ($null -eq $entry) { return $null }
+    }
+
+    $unwrapped = Get-Prop $entry 'value'
+    if ($null -ne $unwrapped) { return $unwrapped }
+    return $entry
+}
+
 function ConvertTo-DisplayString {
     <#
     .SYNOPSIS Flattens a value into a single-line, CSV-safe string.
@@ -1036,12 +1066,18 @@ function Invoke-PreflightValidation {
         foreach ($assignment in $assignments) {
             $definitionId = Get-FirstProp $assignment @('PolicyDefinitionId', 'Properties.PolicyDefinitionId') ''
             $displayName  = Get-FirstProp $assignment @('DisplayName', 'Properties.DisplayName') (Get-Prop $assignment 'Name' 'unnamed')
-            $parameters   = Get-FirstProp $assignment @('Parameter', 'Parameters', 'Properties.Parameters') $null
             $definitionGuid = Get-ResourceNameFromId -ResourceId $definitionId -FromEnd 1
 
             if ($allowedLocationsIds -contains $definitionGuid -and -not [string]::IsNullOrWhiteSpace($Location)) {
-                $allowed = @(Get-Prop (Get-Prop $parameters 'listOfAllowedLocations') 'value' @())
-                if ($allowed.Count -eq 0) { continue }
+                $allowedValue = Get-PolicyParameterValue -Assignment $assignment -ParameterName 'listOfAllowedLocations'
+                if ($null -eq $allowedValue) {
+                    Add-Check -Category 'Policy' -Check 'Allowed locations policy' -Status 'WARN' `
+                        -Detail "'$displayName' is an allowed-locations policy but its region list could not be read." `
+                        -Recommendation 'Confirm the permitted regions in the portal. The target region may be blocked even though this check could not evaluate it.' `
+                        -Scope $displayName
+                    continue
+                }
+                $allowed = @($allowedValue)
                 if ($allowed -contains $Location) {
                     Add-Check -Category 'Policy' -Check 'Allowed locations policy' -Status 'PASS' `
                         -Detail "'$displayName' permits '$Location'." -Scope $displayName
@@ -1054,8 +1090,15 @@ function Invoke-PreflightValidation {
             }
 
             if ($definitionGuid -eq $allowedSkuId -and -not [string]::IsNullOrWhiteSpace($SessionHostVmSize)) {
-                $allowed = @(Get-Prop (Get-Prop $parameters 'listOfAllowedSKUs') 'value' @())
-                if ($allowed.Count -eq 0) { continue }
+                $allowedValue = Get-PolicyParameterValue -Assignment $assignment -ParameterName 'listOfAllowedSKUs'
+                if ($null -eq $allowedValue) {
+                    Add-Check -Category 'Policy' -Check 'Allowed VM SKU policy' -Status 'WARN' `
+                        -Detail "'$displayName' is an allowed-SKU policy but its SKU list could not be read." `
+                        -Recommendation 'Confirm the permitted SKUs in the portal. The planned VM size may be blocked even though this check could not evaluate it.' `
+                        -Scope $displayName
+                    continue
+                }
+                $allowed = @($allowedValue)
                 if ($allowed -contains $SessionHostVmSize) {
                     Add-Check -Category 'Policy' -Check 'Allowed VM SKU policy' -Status 'PASS' `
                         -Detail "'$displayName' permits '$SessionHostVmSize'." -Scope $displayName
