@@ -203,12 +203,19 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------
 # region Cloud Shell Detection
 # ---------------------------------------------
-$script:IsCloudShell = $false
+$script:IsCloudShell    = $false
+$script:CloudDriveInUse = $false
 if ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*' -or $env:ACC_CLOUD -eq 'true') {
     $script:IsCloudShell = $true
     if (-not $PSBoundParameters.ContainsKey('OutputPath')) {
+        # An ephemeral Cloud Shell session has no ~/clouddrive. Falling back to the
+        # working directory is correct, but the run must not claim persistence it
+        # is not getting -- the report is destroyed with the session.
         $cloudDrive = Join-Path $HOME 'clouddrive'
-        if (Test-Path $cloudDrive) { $OutputPath = $cloudDrive }
+        if (Test-Path $cloudDrive) {
+            $OutputPath = $cloudDrive
+            $script:CloudDriveInUse = $true
+        }
     }
 }
 # endregion
@@ -280,6 +287,36 @@ function Get-FirstProp {
         if ($ok) { return $current }
     }
     return $Default
+}
+
+function Get-PolicyParameterValue {
+    <#
+    .SYNOPSIS
+        Reads a named policy assignment parameter, tolerating either envelope.
+    .DESCRIPTION
+        ARM stores assignment parameters as {"name":{"value":X}}. Newer Az versions may
+        surface the value directly as {"name":X}. Both are handled, and when the
+        structured Parameter member is absent the raw JSON form is parsed instead.
+
+        Returns $null only when the parameter genuinely cannot be determined. The caller
+        reports that rather than skipping, because a policy check that silently does
+        nothing reads like a pass.
+    #>
+    param([object]$Assignment, [string]$ParameterName)
+
+    $parameters = Get-FirstProp $Assignment @('Parameter', 'Parameters', 'Properties.Parameters') $null
+    $entry = Get-Prop $parameters $ParameterName
+
+    if ($null -eq $entry) {
+        $raw = Get-FirstProp $Assignment @('ParameterRaw', 'Properties.ParametersRaw', 'ParametersRaw') ''
+        if ([string]::IsNullOrWhiteSpace("$raw")) { return $null }
+        try { $entry = Get-Prop ("$raw" | ConvertFrom-Json) $ParameterName } catch { return $null }
+        if ($null -eq $entry) { return $null }
+    }
+
+    $unwrapped = Get-Prop $entry 'value'
+    if ($null -ne $unwrapped) { return $unwrapped }
+    return $entry
 }
 
 function ConvertTo-DisplayString {
@@ -419,6 +456,54 @@ function Get-SubnetUsableIpCount {
     return $usable
 }
 
+function Test-PortRangeCoversPort {
+    <#
+    .SYNOPSIS
+        Does an NSG destination port specification actually cover a given port?
+    .DESCRIPTION
+        An NSG port field is '*', a single port, an inclusive 'low-high' range, or a
+        comma separated list of those. A previous wildcard match on '*-*' treated every
+        range as a hit, so a deny rule on 8000-9000 was reported as blocking 443.
+    #>
+    param([string]$PortSpec, [int]$Port)
+    if ([string]::IsNullOrWhiteSpace($PortSpec)) { return $false }
+    foreach ($part in ($PortSpec -split ',')) {
+        $token = "$part".Trim()
+        if ($token -eq '*') { return $true }
+        if ($token -match '^([0-9]+)\s*-\s*([0-9]+)$') {
+            $low = [int]$Matches[1]; $high = [int]$Matches[2]
+            if ($Port -ge $low -and $Port -le $high) { return $true }
+            continue
+        }
+        $single = 0
+        if ([int]::TryParse($token, [ref]$single) -and $single -eq $Port) { return $true }
+    }
+    return $false
+}
+
+function Test-AvdPowerOnRole {
+    <#
+    .SYNOPSIS
+        Is a Desktop Virtualization power management role assigned in this subscription?
+    .DESCRIPTION
+        Start VM on Connect and scaling plans both act through the Azure Virtual Desktop
+        service principal, which needs 'Desktop Virtualization Power On Off Contributor'
+        (or at minimum 'Power On Contributor') at subscription or resource group scope.
+        Without it the service cannot start a deallocated host: users get a connection
+        failure and autoscale silently does nothing.
+
+        Callers must wrap the result in @(): an empty array returned from a function
+        enumerates to nothing, so the assignment yields $null and .Count throws under
+        StrictMode.
+    #>
+    $powerRoles = @(
+        'Desktop Virtualization Power On Off Contributor',
+        'Desktop Virtualization Power On Contributor'
+    )
+    return @(Get-AzRoleAssignment -Scope $script:SubscriptionScope -ErrorAction SilentlyContinue |
+        Where-Object { $powerRoles -contains (Get-Prop $_ 'RoleDefinitionName' '') })
+}
+
 function Test-TcpEndpoint {
     <#
     .SYNOPSIS
@@ -508,7 +593,12 @@ Write-Log "Mode          : $Mode"
 Write-Log "Run timestamp : $script:Timestamp"
 Write-Log "Output target : $script:RootDir"
 if ($script:IsCloudShell) {
-    Write-Log 'Environment   : Azure Cloud Shell detected -- output defaults to ~/clouddrive for persistence.'
+    if ($script:CloudDriveInUse) {
+        Write-Log 'Environment   : Azure Cloud Shell -- output written to ~/clouddrive so it survives the session.'
+    } else {
+        Write-Log 'Environment   : Azure Cloud Shell with no ~/clouddrive mounted (ephemeral session).' -Level WARN
+        Write-Log '                Output is NOT persistent and will be destroyed when this session ends.' -Level WARN
+    }
 }
 
 # endregion
@@ -531,12 +621,9 @@ $requiredModules = @(
 # Optional modules power individual checks. When one is missing the dependent checks
 # report SKIP instead of failing the run.
 $optionalModules = @(
-    'Az.OperationalInsights',
-    'Az.Monitor',
-    'Az.RecoveryServices',
-    'Az.KeyVault',
-    'Az.PrivateDns',
-    'Az.PolicyInsights'
+    'Az.OperationalInsights',   # Get-AzOperationalInsightsWorkspace
+    'Az.Monitor',               # Get-AzDiagnosticSetting
+    'Az.RecoveryServices'       # Get-AzRecoveryServicesVault / -BackupItem
 )
 
 foreach ($moduleName in $requiredModules) {
@@ -697,6 +784,19 @@ function Invoke-PreflightValidation {
         }
     }
 
+    Invoke-Check -Category 'Identity' -Check 'AVD power management role' -Scope $script:SubscriptionScope -Body {
+        $powerAssignments = @(Test-AvdPowerOnRole)
+        if ($powerAssignments.Count -gt 0) {
+            $roles = @($powerAssignments | ForEach-Object { Get-Prop $_ 'RoleDefinitionName' '' } | Sort-Object -Unique)
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'PASS' `
+                -Detail "$($powerAssignments.Count) assignment(s) present: $($roles -join ', ')."
+        } else {
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'WARN' `
+                -Detail 'No Desktop Virtualization Power On Off / Power On Contributor assignment found in this subscription.' `
+                -Recommendation 'Required before Start VM on Connect or a scaling plan will work: assign Desktop Virtualization Power On Off Contributor to the Azure Virtual Desktop service principal at subscription or resource group scope. Without it the service cannot start a deallocated host, so users get connection failures and autoscale silently does nothing.'
+        }
+    }
+
     # -----------------------------------------
     # Resource providers
     # -----------------------------------------
@@ -820,8 +920,11 @@ function Invoke-PreflightValidation {
     $script:PlannedVmFamily    = ''
 
     if ([string]::IsNullOrWhiteSpace($Location) -or [string]::IsNullOrWhiteSpace($SessionHostVmSize)) {
+        $missingCapacityInputs = @()
+        if ([string]::IsNullOrWhiteSpace($Location))          { $missingCapacityInputs += '-Location' }
+        if ([string]::IsNullOrWhiteSpace($SessionHostVmSize)) { $missingCapacityInputs += '-SessionHostVmSize' }
         Add-Check -Category 'Capacity' -Check 'Session host SKU' -Status 'SKIP' `
-            -Detail 'Requires both -Location and -SessionHostVmSize.' `
+            -Detail "Not supplied: $($missingCapacityInputs -join ', ')." `
             -Recommendation 'Supply the planned VM size to validate regional availability, zone support and vCPU quota.'
     } else {
         Invoke-Check -Category 'Capacity' -Check 'Session host SKU' -Body {
@@ -1039,12 +1142,18 @@ function Invoke-PreflightValidation {
         foreach ($assignment in $assignments) {
             $definitionId = Get-FirstProp $assignment @('PolicyDefinitionId', 'Properties.PolicyDefinitionId') ''
             $displayName  = Get-FirstProp $assignment @('DisplayName', 'Properties.DisplayName') (Get-Prop $assignment 'Name' 'unnamed')
-            $parameters   = Get-FirstProp $assignment @('Parameter', 'Parameters', 'Properties.Parameters') $null
             $definitionGuid = Get-ResourceNameFromId -ResourceId $definitionId -FromEnd 1
 
             if ($allowedLocationsIds -contains $definitionGuid -and -not [string]::IsNullOrWhiteSpace($Location)) {
-                $allowed = @(Get-Prop (Get-Prop $parameters 'listOfAllowedLocations') 'value' @())
-                if ($allowed.Count -eq 0) { continue }
+                $allowedValue = Get-PolicyParameterValue -Assignment $assignment -ParameterName 'listOfAllowedLocations'
+                if ($null -eq $allowedValue) {
+                    Add-Check -Category 'Policy' -Check 'Allowed locations policy' -Status 'WARN' `
+                        -Detail "'$displayName' is an allowed-locations policy but its region list could not be read." `
+                        -Recommendation 'Confirm the permitted regions in the portal. The target region may be blocked even though this check could not evaluate it.' `
+                        -Scope $displayName
+                    continue
+                }
+                $allowed = @($allowedValue)
                 if ($allowed -contains $Location) {
                     Add-Check -Category 'Policy' -Check 'Allowed locations policy' -Status 'PASS' `
                         -Detail "'$displayName' permits '$Location'." -Scope $displayName
@@ -1057,8 +1166,15 @@ function Invoke-PreflightValidation {
             }
 
             if ($definitionGuid -eq $allowedSkuId -and -not [string]::IsNullOrWhiteSpace($SessionHostVmSize)) {
-                $allowed = @(Get-Prop (Get-Prop $parameters 'listOfAllowedSKUs') 'value' @())
-                if ($allowed.Count -eq 0) { continue }
+                $allowedValue = Get-PolicyParameterValue -Assignment $assignment -ParameterName 'listOfAllowedSKUs'
+                if ($null -eq $allowedValue) {
+                    Add-Check -Category 'Policy' -Check 'Allowed VM SKU policy' -Status 'WARN' `
+                        -Detail "'$displayName' is an allowed-SKU policy but its SKU list could not be read." `
+                        -Recommendation 'Confirm the permitted SKUs in the portal. The planned VM size may be blocked even though this check could not evaluate it.' `
+                        -Scope $displayName
+                    continue
+                }
+                $allowed = @($allowedValue)
                 if ($allowed -contains $SessionHostVmSize) {
                     Add-Check -Category 'Policy' -Check 'Allowed VM SKU policy' -Status 'PASS' `
                         -Detail "'$displayName' permits '$SessionHostVmSize'." -Scope $displayName
@@ -1097,7 +1213,7 @@ function Invoke-PreflightValidation {
         if ($denyAssignments.Count -gt 0) {
             Add-Check -Category 'Policy' -Check 'Deny policy exposure' -Status 'WARN' `
                 -Detail "$($denyAssignments.Count) deny-effect assignment(s): $(($denyAssignments | Select-Object -First 10) -join ', ')." `
-                -Recommendation 'Review each against the planned deployment. A deny on public IPs, required tags or disk encryption commonly blocks AVD session host creation.'
+                -Recommendation "Only the built-in allowed-locations and allowed-SKU policies are compared against your target automatically. If any assignment above restricts regions or VM sizes, confirm by hand that it permits '$Location' and the planned size. A deny on public IPs, required tags or disk encryption also commonly blocks session host creation."
         } else {
             Add-Check -Category 'Policy' -Check 'Deny policy exposure' -Status 'PASS' `
                 -Detail "No deny-effect policy definitions found in the first $inspected assignment(s) inspected."
@@ -1119,8 +1235,11 @@ function Invoke-PreflightValidation {
     Write-Section 'Networking'
 
     if ([string]::IsNullOrWhiteSpace($VirtualNetworkName) -or [string]::IsNullOrWhiteSpace($VirtualNetworkResourceGroup)) {
+        $missingNetworkInputs = @()
+        if ([string]::IsNullOrWhiteSpace($VirtualNetworkName))          { $missingNetworkInputs += '-VirtualNetworkName' }
+        if ([string]::IsNullOrWhiteSpace($VirtualNetworkResourceGroup)) { $missingNetworkInputs += '-VirtualNetworkResourceGroup (or -ResourceGroupName)' }
         Add-Check -Category 'Network' -Check 'Virtual network' -Status 'SKIP' `
-            -Detail 'Requires -VirtualNetworkName and a resource group.' `
+            -Detail "Not supplied: $($missingNetworkInputs -join ', ')." `
             -Recommendation 'Supply the session host VNet to validate IP capacity, DNS, NSG egress and routing.'
     } else {
         $vnet = $null
@@ -1321,7 +1440,7 @@ function Invoke-PreflightValidation {
                         $destinations = @(Get-Prop $rule 'DestinationAddressPrefix' @())
                         $ports        = @(Get-Prop $rule 'DestinationPortRange' @())
                         $coversAvd    = @($destinations | Where-Object { $avdDestinations -contains "$_" }).Count -gt 0
-                        $covers443    = @($ports | Where-Object { "$_" -eq '*' -or "$_" -eq '443' -or "$_" -like '*-*' }).Count -gt 0
+                        $covers443    = @($ports | Where-Object { Test-PortRangeCoversPort -PortSpec "$_" -Port 443 }).Count -gt 0
                         if (-not ($coversAvd -and $covers443)) { continue }
                         if ((Get-Prop $rule 'Access' '') -eq 'Allow') {
                             # An allow at a higher precedence wins; egress is open.
@@ -1811,10 +1930,11 @@ function Invoke-PostDeploymentValidation {
     Write-Log '==================================================='
 
     # Subscription-wide caches so per-host lookups do not become per-host API calls.
-    $script:AllVms         = $null
-    $script:AllNics        = $null
-    $script:AllExtensions  = $null
-    $script:ProtectedVmIds = $null
+    $script:AllVms          = $null
+    $script:AllNics         = $null
+    $script:AllExtensions   = $null
+    $script:ProtectedVmIds  = $null
+    $script:AllScalingPlans = $null
 
     Write-Section 'Host Pool Discovery'
 
@@ -2364,6 +2484,26 @@ function Test-AvdHostPool {
                     -Scope $poolName
             }
 
+            # Entra ID joined hosts require a VM login role for interactive sign-in.
+            $entraJoined = @($poolExtensions | Where-Object {
+                "$(Get-Prop (Get-Prop $_ 'Properties') 'type' '')" -eq 'AADLoginForWindows'
+            })
+            if ($entraJoined.Count -gt 0) {
+                $loginRoles = @('Virtual Machine User Login', 'Virtual Machine Administrator Login')
+                $loginAssignments = @(Get-AzRoleAssignment -Scope $script:SubscriptionScope -ErrorAction SilentlyContinue |
+                    Where-Object { $loginRoles -contains (Get-Prop $_ 'RoleDefinitionName' '') })
+                if ($loginAssignments.Count -gt 0) {
+                    $roles = @($loginAssignments | ForEach-Object { Get-Prop $_ 'RoleDefinitionName' '' } | Sort-Object -Unique)
+                    Add-Check -Category 'SessionHostVM' -Check 'Entra VM login role' -Status 'PASS' `
+                        -Detail "$($loginAssignments.Count) assignment(s) present: $($roles -join ', ')." -Scope $poolName
+                } else {
+                    Add-Check -Category 'SessionHostVM' -Check 'Entra VM login role' -Status 'FAIL' `
+                        -Detail 'Session hosts are Microsoft Entra joined but no Virtual Machine User Login or Administrator Login role is assigned.' `
+                        -Recommendation 'Without it users authenticate to AVD but cannot sign in to the session host. Assign Virtual Machine User Login to the AVD user group at resource group or subscription scope.' `
+                        -Scope $poolName
+                }
+            }
+
             # Monitoring agent coverage.
             $monitoringExtensions = @($poolExtensions | Where-Object {
                 "$(Get-Prop (Get-Prop $_ 'Properties') 'type' '')" -in @('AzureMonitorWindowsAgent', 'MicrosoftMonitoringAgent')
@@ -2393,7 +2533,8 @@ function Test-AvdHostPool {
     # Scaling plan
     # -----------------------------------------
     Invoke-Check -Category 'Scaling' -Check 'Scaling plan' -Scope $poolName -Body {
-        $scalingPlans = @(Get-AzWvdScalingPlan -ErrorAction SilentlyContinue)
+        if ($null -eq $script:AllScalingPlans) { $script:AllScalingPlans = @(Get-AzWvdScalingPlan -ErrorAction SilentlyContinue) }
+        $scalingPlans = @($script:AllScalingPlans)
         $attached = @($scalingPlans | Where-Object {
             @(Get-Prop $_ 'HostPoolReference' @()) | Where-Object { (Get-Prop $_ 'HostPoolArmPath' '') -eq $poolId }
         })
@@ -2429,6 +2570,44 @@ function Test-AvdHostPool {
                     -Recommendation 'Enable Start VM on Connect so users can reach hosts that autoscale has deallocated.' `
                     -Scope $poolName
             }
+        }
+    }
+
+    # -----------------------------------------
+    # AVD power management RBAC
+    # -----------------------------------------
+    Invoke-Check -Category 'Identity' -Check 'AVD power management role' -Scope $poolName -Body {
+        if ($null -eq $script:AllScalingPlans) { $script:AllScalingPlans = @(Get-AzWvdScalingPlan -ErrorAction SilentlyContinue) }
+        $planAttached = @($script:AllScalingPlans | Where-Object {
+            @(Get-Prop $_ 'HostPoolReference' @()) | Where-Object { (Get-Prop $_ 'HostPoolArmPath' '') -eq $poolId }
+        }).Count -gt 0
+        $startOnConnect = "$(Get-Prop $HostPool 'StartVMOnConnect' $false)" -eq 'True'
+        $powerAssignments = @(Test-AvdPowerOnRole)
+
+        if ($powerAssignments.Count -gt 0) {
+            $roles = @($powerAssignments | ForEach-Object { Get-Prop $_ 'RoleDefinitionName' '' } | Sort-Object -Unique)
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'PASS' `
+                -Detail "Power management role assigned: $($roles -join ', ')." -Scope $poolName
+            # A scaling plan needs to deallocate as well as start, so Power On alone is short.
+            if ($planAttached -and ($roles -notcontains 'Desktop Virtualization Power On Off Contributor')) {
+                Add-Check -Category 'Identity' -Check 'Power role sufficiency' -Status 'WARN' `
+                    -Detail "A scaling plan is attached but only '$($roles -join ', ')' is assigned." `
+                    -Recommendation 'Autoscale must deallocate as well as start hosts. Assign Desktop Virtualization Power On Off Contributor.' `
+                    -Scope $poolName
+            }
+        } elseif ($startOnConnect -or $planAttached) {
+            $why = @()
+            if ($startOnConnect) { $why += 'Start VM on Connect is enabled' }
+            if ($planAttached)   { $why += 'a scaling plan is attached' }
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'FAIL' `
+                -Detail "$($why -join ' and '), but no Desktop Virtualization power management role is assigned in this subscription." `
+                -Recommendation 'The Azure Virtual Desktop service principal cannot start a deallocated session host without it: users hit connection failures and autoscale does nothing. Assign Desktop Virtualization Power On Off Contributor at subscription or resource group scope.' `
+                -Scope $poolName
+        } else {
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'INFO' `
+                -Detail 'No power management role assigned, and neither Start VM on Connect nor a scaling plan is in use.' `
+                -Recommendation 'Assign Desktop Virtualization Power On Off Contributor before enabling either.' `
+                -Scope $poolName
         }
     }
 
@@ -2780,6 +2959,10 @@ Write-Log "FAIL $failCount | WARN $warnCount | PASS $passCount | INFO $infoCount
 Write-Log "Report folder : $script:RootDir"
 Write-Log "Report        : $reportPath"
 if ($zipPath) { Write-Log "ZIP archive   : $zipPath" }
+if ($script:IsCloudShell -and -not $script:CloudDriveInUse) {
+    Write-Log 'WARNING: this Cloud Shell session is ephemeral -- the files above vanish when it ends.' -Level WARN
+    Write-Log "         Read it now with:  Get-Content '$reportPath'" -Level WARN
+}
 Write-Log '==================================================='
 
 if ($PassThru) { $results }
