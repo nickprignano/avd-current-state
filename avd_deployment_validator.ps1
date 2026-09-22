@@ -456,6 +456,54 @@ function Get-SubnetUsableIpCount {
     return $usable
 }
 
+function Test-PortRangeCoversPort {
+    <#
+    .SYNOPSIS
+        Does an NSG destination port specification actually cover a given port?
+    .DESCRIPTION
+        An NSG port field is '*', a single port, an inclusive 'low-high' range, or a
+        comma separated list of those. A previous wildcard match on '*-*' treated every
+        range as a hit, so a deny rule on 8000-9000 was reported as blocking 443.
+    #>
+    param([string]$PortSpec, [int]$Port)
+    if ([string]::IsNullOrWhiteSpace($PortSpec)) { return $false }
+    foreach ($part in ($PortSpec -split ',')) {
+        $token = "$part".Trim()
+        if ($token -eq '*') { return $true }
+        if ($token -match '^([0-9]+)\s*-\s*([0-9]+)$') {
+            $low = [int]$Matches[1]; $high = [int]$Matches[2]
+            if ($Port -ge $low -and $Port -le $high) { return $true }
+            continue
+        }
+        $single = 0
+        if ([int]::TryParse($token, [ref]$single) -and $single -eq $Port) { return $true }
+    }
+    return $false
+}
+
+function Test-AvdPowerOnRole {
+    <#
+    .SYNOPSIS
+        Is a Desktop Virtualization power management role assigned in this subscription?
+    .DESCRIPTION
+        Start VM on Connect and scaling plans both act through the Azure Virtual Desktop
+        service principal, which needs 'Desktop Virtualization Power On Off Contributor'
+        (or at minimum 'Power On Contributor') at subscription or resource group scope.
+        Without it the service cannot start a deallocated host: users get a connection
+        failure and autoscale silently does nothing.
+
+        Callers must wrap the result in @(): an empty array returned from a function
+        enumerates to nothing, so the assignment yields $null and .Count throws under
+        StrictMode.
+    #>
+    $powerRoles = @(
+        'Desktop Virtualization Power On Off Contributor',
+        'Desktop Virtualization Power On Contributor'
+    )
+    return @(Get-AzRoleAssignment -Scope $script:SubscriptionScope -ErrorAction SilentlyContinue |
+        Where-Object { $powerRoles -contains (Get-Prop $_ 'RoleDefinitionName' '') })
+}
+
 function Test-TcpEndpoint {
     <#
     .SYNOPSIS
@@ -733,6 +781,19 @@ function Invoke-PreflightValidation {
             Add-Check -Category 'Identity' -Check 'Deployment role coverage' -Status 'INFO' `
                 -Detail "Current identity holds read-level roles only: $($roleNames -join ', ')." `
                 -Recommendation 'Expected for a read-only validation run. Ensure the deploying identity separately holds Contributor or the AVD-specific write roles.'
+        }
+    }
+
+    Invoke-Check -Category 'Identity' -Check 'AVD power management role' -Scope $script:SubscriptionScope -Body {
+        $powerAssignments = @(Test-AvdPowerOnRole)
+        if ($powerAssignments.Count -gt 0) {
+            $roles = @($powerAssignments | ForEach-Object { Get-Prop $_ 'RoleDefinitionName' '' } | Sort-Object -Unique)
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'PASS' `
+                -Detail "$($powerAssignments.Count) assignment(s) present: $($roles -join ', ')."
+        } else {
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'WARN' `
+                -Detail 'No Desktop Virtualization Power On Off / Power On Contributor assignment found in this subscription.' `
+                -Recommendation 'Required before Start VM on Connect or a scaling plan will work: assign Desktop Virtualization Power On Off Contributor to the Azure Virtual Desktop service principal at subscription or resource group scope. Without it the service cannot start a deallocated host, so users get connection failures and autoscale silently does nothing.'
         }
     }
 
@@ -1379,7 +1440,7 @@ function Invoke-PreflightValidation {
                         $destinations = @(Get-Prop $rule 'DestinationAddressPrefix' @())
                         $ports        = @(Get-Prop $rule 'DestinationPortRange' @())
                         $coversAvd    = @($destinations | Where-Object { $avdDestinations -contains "$_" }).Count -gt 0
-                        $covers443    = @($ports | Where-Object { "$_" -eq '*' -or "$_" -eq '443' -or "$_" -like '*-*' }).Count -gt 0
+                        $covers443    = @($ports | Where-Object { Test-PortRangeCoversPort -PortSpec "$_" -Port 443 }).Count -gt 0
                         if (-not ($coversAvd -and $covers443)) { continue }
                         if ((Get-Prop $rule 'Access' '') -eq 'Allow') {
                             # An allow at a higher precedence wins; egress is open.
@@ -1869,10 +1930,11 @@ function Invoke-PostDeploymentValidation {
     Write-Log '==================================================='
 
     # Subscription-wide caches so per-host lookups do not become per-host API calls.
-    $script:AllVms         = $null
-    $script:AllNics        = $null
-    $script:AllExtensions  = $null
-    $script:ProtectedVmIds = $null
+    $script:AllVms          = $null
+    $script:AllNics         = $null
+    $script:AllExtensions   = $null
+    $script:ProtectedVmIds  = $null
+    $script:AllScalingPlans = $null
 
     Write-Section 'Host Pool Discovery'
 
@@ -2422,6 +2484,26 @@ function Test-AvdHostPool {
                     -Scope $poolName
             }
 
+            # Entra ID joined hosts require a VM login role for interactive sign-in.
+            $entraJoined = @($poolExtensions | Where-Object {
+                "$(Get-Prop (Get-Prop $_ 'Properties') 'type' '')" -eq 'AADLoginForWindows'
+            })
+            if ($entraJoined.Count -gt 0) {
+                $loginRoles = @('Virtual Machine User Login', 'Virtual Machine Administrator Login')
+                $loginAssignments = @(Get-AzRoleAssignment -Scope $script:SubscriptionScope -ErrorAction SilentlyContinue |
+                    Where-Object { $loginRoles -contains (Get-Prop $_ 'RoleDefinitionName' '') })
+                if ($loginAssignments.Count -gt 0) {
+                    $roles = @($loginAssignments | ForEach-Object { Get-Prop $_ 'RoleDefinitionName' '' } | Sort-Object -Unique)
+                    Add-Check -Category 'SessionHostVM' -Check 'Entra VM login role' -Status 'PASS' `
+                        -Detail "$($loginAssignments.Count) assignment(s) present: $($roles -join ', ')." -Scope $poolName
+                } else {
+                    Add-Check -Category 'SessionHostVM' -Check 'Entra VM login role' -Status 'FAIL' `
+                        -Detail 'Session hosts are Microsoft Entra joined but no Virtual Machine User Login or Administrator Login role is assigned.' `
+                        -Recommendation 'Without it users authenticate to AVD but cannot sign in to the session host. Assign Virtual Machine User Login to the AVD user group at resource group or subscription scope.' `
+                        -Scope $poolName
+                }
+            }
+
             # Monitoring agent coverage.
             $monitoringExtensions = @($poolExtensions | Where-Object {
                 "$(Get-Prop (Get-Prop $_ 'Properties') 'type' '')" -in @('AzureMonitorWindowsAgent', 'MicrosoftMonitoringAgent')
@@ -2451,7 +2533,8 @@ function Test-AvdHostPool {
     # Scaling plan
     # -----------------------------------------
     Invoke-Check -Category 'Scaling' -Check 'Scaling plan' -Scope $poolName -Body {
-        $scalingPlans = @(Get-AzWvdScalingPlan -ErrorAction SilentlyContinue)
+        if ($null -eq $script:AllScalingPlans) { $script:AllScalingPlans = @(Get-AzWvdScalingPlan -ErrorAction SilentlyContinue) }
+        $scalingPlans = @($script:AllScalingPlans)
         $attached = @($scalingPlans | Where-Object {
             @(Get-Prop $_ 'HostPoolReference' @()) | Where-Object { (Get-Prop $_ 'HostPoolArmPath' '') -eq $poolId }
         })
@@ -2487,6 +2570,44 @@ function Test-AvdHostPool {
                     -Recommendation 'Enable Start VM on Connect so users can reach hosts that autoscale has deallocated.' `
                     -Scope $poolName
             }
+        }
+    }
+
+    # -----------------------------------------
+    # AVD power management RBAC
+    # -----------------------------------------
+    Invoke-Check -Category 'Identity' -Check 'AVD power management role' -Scope $poolName -Body {
+        if ($null -eq $script:AllScalingPlans) { $script:AllScalingPlans = @(Get-AzWvdScalingPlan -ErrorAction SilentlyContinue) }
+        $planAttached = @($script:AllScalingPlans | Where-Object {
+            @(Get-Prop $_ 'HostPoolReference' @()) | Where-Object { (Get-Prop $_ 'HostPoolArmPath' '') -eq $poolId }
+        }).Count -gt 0
+        $startOnConnect = "$(Get-Prop $HostPool 'StartVMOnConnect' $false)" -eq 'True'
+        $powerAssignments = @(Test-AvdPowerOnRole)
+
+        if ($powerAssignments.Count -gt 0) {
+            $roles = @($powerAssignments | ForEach-Object { Get-Prop $_ 'RoleDefinitionName' '' } | Sort-Object -Unique)
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'PASS' `
+                -Detail "Power management role assigned: $($roles -join ', ')." -Scope $poolName
+            # A scaling plan needs to deallocate as well as start, so Power On alone is short.
+            if ($planAttached -and ($roles -notcontains 'Desktop Virtualization Power On Off Contributor')) {
+                Add-Check -Category 'Identity' -Check 'Power role sufficiency' -Status 'WARN' `
+                    -Detail "A scaling plan is attached but only '$($roles -join ', ')' is assigned." `
+                    -Recommendation 'Autoscale must deallocate as well as start hosts. Assign Desktop Virtualization Power On Off Contributor.' `
+                    -Scope $poolName
+            }
+        } elseif ($startOnConnect -or $planAttached) {
+            $why = @()
+            if ($startOnConnect) { $why += 'Start VM on Connect is enabled' }
+            if ($planAttached)   { $why += 'a scaling plan is attached' }
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'FAIL' `
+                -Detail "$($why -join ' and '), but no Desktop Virtualization power management role is assigned in this subscription." `
+                -Recommendation 'The Azure Virtual Desktop service principal cannot start a deallocated session host without it: users hit connection failures and autoscale does nothing. Assign Desktop Virtualization Power On Off Contributor at subscription or resource group scope.' `
+                -Scope $poolName
+        } else {
+            Add-Check -Category 'Identity' -Check 'AVD power management role' -Status 'INFO' `
+                -Detail 'No power management role assigned, and neither Start VM on Connect nor a scaling plan is in use.' `
+                -Recommendation 'Assign Desktop Virtualization Power On Off Contributor before enabling either.' `
+                -Scope $poolName
         }
     }
 
