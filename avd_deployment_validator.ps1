@@ -203,12 +203,19 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------
 # region Cloud Shell Detection
 # ---------------------------------------------
-$script:IsCloudShell = $false
+$script:IsCloudShell    = $false
+$script:CloudDriveInUse = $false
 if ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*' -or $env:ACC_CLOUD -eq 'true') {
     $script:IsCloudShell = $true
     if (-not $PSBoundParameters.ContainsKey('OutputPath')) {
+        # An ephemeral Cloud Shell session has no ~/clouddrive. Falling back to the
+        # working directory is correct, but the run must not claim persistence it
+        # is not getting -- the report is destroyed with the session.
         $cloudDrive = Join-Path $HOME 'clouddrive'
-        if (Test-Path $cloudDrive) { $OutputPath = $cloudDrive }
+        if (Test-Path $cloudDrive) {
+            $OutputPath = $cloudDrive
+            $script:CloudDriveInUse = $true
+        }
     }
 }
 # endregion
@@ -538,7 +545,12 @@ Write-Log "Mode          : $Mode"
 Write-Log "Run timestamp : $script:Timestamp"
 Write-Log "Output target : $script:RootDir"
 if ($script:IsCloudShell) {
-    Write-Log 'Environment   : Azure Cloud Shell detected -- output defaults to ~/clouddrive for persistence.'
+    if ($script:CloudDriveInUse) {
+        Write-Log 'Environment   : Azure Cloud Shell -- output written to ~/clouddrive so it survives the session.'
+    } else {
+        Write-Log 'Environment   : Azure Cloud Shell with no ~/clouddrive mounted (ephemeral session).' -Level WARN
+        Write-Log '                Output is NOT persistent and will be destroyed when this session ends.' -Level WARN
+    }
 }
 
 # endregion
@@ -847,8 +859,11 @@ function Invoke-PreflightValidation {
     $script:PlannedVmFamily    = ''
 
     if ([string]::IsNullOrWhiteSpace($Location) -or [string]::IsNullOrWhiteSpace($SessionHostVmSize)) {
+        $missingCapacityInputs = @()
+        if ([string]::IsNullOrWhiteSpace($Location))          { $missingCapacityInputs += '-Location' }
+        if ([string]::IsNullOrWhiteSpace($SessionHostVmSize)) { $missingCapacityInputs += '-SessionHostVmSize' }
         Add-Check -Category 'Capacity' -Check 'Session host SKU' -Status 'SKIP' `
-            -Detail 'Requires both -Location and -SessionHostVmSize.' `
+            -Detail "Not supplied: $($missingCapacityInputs -join ', ')." `
             -Recommendation 'Supply the planned VM size to validate regional availability, zone support and vCPU quota.'
     } else {
         Invoke-Check -Category 'Capacity' -Check 'Session host SKU' -Body {
@@ -1137,7 +1152,7 @@ function Invoke-PreflightValidation {
         if ($denyAssignments.Count -gt 0) {
             Add-Check -Category 'Policy' -Check 'Deny policy exposure' -Status 'WARN' `
                 -Detail "$($denyAssignments.Count) deny-effect assignment(s): $(($denyAssignments | Select-Object -First 10) -join ', ')." `
-                -Recommendation 'Review each against the planned deployment. A deny on public IPs, required tags or disk encryption commonly blocks AVD session host creation.'
+                -Recommendation "Only the built-in allowed-locations and allowed-SKU policies are compared against your target automatically. If any assignment above restricts regions or VM sizes, confirm by hand that it permits '$Location' and the planned size. A deny on public IPs, required tags or disk encryption also commonly blocks session host creation."
         } else {
             Add-Check -Category 'Policy' -Check 'Deny policy exposure' -Status 'PASS' `
                 -Detail "No deny-effect policy definitions found in the first $inspected assignment(s) inspected."
@@ -1159,8 +1174,11 @@ function Invoke-PreflightValidation {
     Write-Section 'Networking'
 
     if ([string]::IsNullOrWhiteSpace($VirtualNetworkName) -or [string]::IsNullOrWhiteSpace($VirtualNetworkResourceGroup)) {
+        $missingNetworkInputs = @()
+        if ([string]::IsNullOrWhiteSpace($VirtualNetworkName))          { $missingNetworkInputs += '-VirtualNetworkName' }
+        if ([string]::IsNullOrWhiteSpace($VirtualNetworkResourceGroup)) { $missingNetworkInputs += '-VirtualNetworkResourceGroup (or -ResourceGroupName)' }
         Add-Check -Category 'Network' -Check 'Virtual network' -Status 'SKIP' `
-            -Detail 'Requires -VirtualNetworkName and a resource group.' `
+            -Detail "Not supplied: $($missingNetworkInputs -join ', ')." `
             -Recommendation 'Supply the session host VNet to validate IP capacity, DNS, NSG egress and routing.'
     } else {
         $vnet = $null
@@ -2820,6 +2838,10 @@ Write-Log "FAIL $failCount | WARN $warnCount | PASS $passCount | INFO $infoCount
 Write-Log "Report folder : $script:RootDir"
 Write-Log "Report        : $reportPath"
 if ($zipPath) { Write-Log "ZIP archive   : $zipPath" }
+if ($script:IsCloudShell -and -not $script:CloudDriveInUse) {
+    Write-Log 'WARNING: this Cloud Shell session is ephemeral -- the files above vanish when it ends.' -Level WARN
+    Write-Log "         Read it now with:  Get-Content '$reportPath'" -Level WARN
+}
 Write-Log '==================================================='
 
 if ($PassThru) { $results }
