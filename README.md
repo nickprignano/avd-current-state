@@ -299,10 +299,10 @@ always win. Keys beginning with `_` are treated as comments.
 
 | Category | Checks |
 |---|---|
-| Identity | Azure Commercial environment, subscription state, Reader access, deployment role coverage |
+| Identity | Azure Commercial environment, subscription state, Reader access, deployment role coverage, Desktop Virtualization power management role |
 | Providers | Registration state of the required and recommended resource providers |
 | Region | Target region availability, AVD metadata region support (read live from the resource provider) |
-| Capacity | VM SKU availability and restrictions, availability zone support, Hyper-V generation, per-family vCPU quota, total regional vCPU quota, network interface quota |
+| Capacity | VM SKU availability and restrictions, availability zone support, Hyper-V generation, per-family vCPU quota, total regional vCPU quota, network interface quota. On a family quota failure it names the families in the region that do have headroom, and it warns when the regional ceiling is passed by less than one more host |
 | Resource group | Existence, and `ReadOnly` locks that would block deployment |
 | Policy | Allowed-locations and allowed-SKU policies compared against the target, deny-effect assignment sweep, unexpanded initiative count |
 | Network | VNet existence and region match, custom DNS for domain join, peering health, subnet existence, usable IP capacity vs. host count plus buffer, subnet delegation, outbound egress path (NAT gateway / forced tunneling / no default route), NSG rules that would block outbound 443 to the AVD control plane |
@@ -320,9 +320,10 @@ always win. Keys beginning with `_` are treated as comments.
 | Registration | Registration token presence and expiry, flagged as a security exposure while live |
 | App groups | Application groups linked to the host pool, published to exactly one workspace, `Desktop Virtualization User` role assigned, preferred app group type alignment |
 | Session hosts | Registered count vs. expected, availability status, drain mode, heartbeat freshness, agent / SxS stack / OS version drift, agent update state, pool utilisation |
-| Session host VMs | VM correlation, power state, provisioning state, availability zone spread, extension provisioning failures, domain join method, monitoring agent coverage |
+| Session host VMs | VM correlation, power state, provisioning state, availability zone spread, extension provisioning failures, domain join method, monitoring agent coverage, and for Microsoft Entra joined hosts a `Virtual Machine User Login` role assignment |
 | Storage | Everything in the preflight storage set, plus SMB data-plane role assignments |
 | Scaling | Scaling plan attached and enabled, Start VM on Connect consistency |
+| Identity | Desktop Virtualization power management role, graded by whether Start VM on Connect or a scaling plan is actually in use, plus whether a scaling plan has only `Power On` when it needs `Power On Off` |
 | Diagnostics | Host pool diagnostic settings and the enabled AVD log categories |
 | Resilience | Azure Backup coverage for personal session host VMs |
 | Sessions | Active vs. disconnected user sessions |
