@@ -230,6 +230,12 @@ $script:LogMessages  = [System.Collections.Generic.List[string]]::new()
 $script:Results      = [System.Collections.Generic.List[psobject]]::new()
 $script:CurrentPhase = 'Preflight'
 $script:Context      = $null
+
+# The network checks are nested under the VNet lookup, so a failure part way down
+# prevents later ones from running. These lists let those be reported as SKIP rather
+# than silently absent -- an absent row cannot be told apart from a passing one.
+$script:VnetDependentChecks   = @('VNet region', 'VNet DNS', 'VNet peerings', 'Session host subnet')
+$script:SubnetDependentChecks = @('Subnet IP capacity', 'Subnet delegation', 'Outbound connectivity', 'Subnet NSG', 'NSG egress to AVD')
 # endregion
 
 # ---------------------------------------------
@@ -374,6 +380,29 @@ function Add-Check {
     $line = "  [{0}] {1,-26} {2}" -f $Status.PadRight(4), $Check, $record.Detail
     Write-Host $line -ForegroundColor $color
     $script:LogMessages.Add("[$Status] [$Category] $Check :: $($record.Detail)")
+}
+
+function Add-SkippedChecks {
+    <#
+    .SYNOPSIS
+        Records a SKIP for every check a preceding failure stopped from running.
+    .DESCRIPTION
+        Without this, an early return leaves the downstream checks out of the report
+        altogether, and a missing row is ambiguous: the reader cannot tell whether the
+        check passed or was never reached. Stating it explicitly keeps the report honest
+        about the limits of what it verified.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [Parameter(Mandatory = $true)][string[]]$Checks,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Recommendation = '',
+        [string]$Scope = ''
+    )
+    foreach ($checkName in $Checks) {
+        Add-Check -Category $Category -Check $checkName -Status 'SKIP' `
+            -Detail "Not evaluated: $Reason" -Recommendation $Recommendation -Scope $Scope
+    }
 }
 
 function Invoke-Check {
@@ -1276,6 +1305,9 @@ function Invoke-PreflightValidation {
         Add-Check -Category 'Network' -Check 'Virtual network' -Status 'SKIP' `
             -Detail "Not supplied: $($missingNetworkInputs -join ', ')." `
             -Recommendation 'Supply the session host VNet to validate IP capacity, DNS, NSG egress and routing.'
+        Add-SkippedChecks -Category 'Network' -Checks ($script:VnetDependentChecks + $script:SubnetDependentChecks) `
+            -Reason 'the session host VNet was not supplied.' `
+            -Recommendation 'Supply -VirtualNetworkName, its resource group and -SubnetName to evaluate these.'
     } else {
         $vnet = $null
         Invoke-Check -Category 'Network' -Check 'Virtual network' -Scope $VirtualNetworkName -Body {
@@ -1284,6 +1316,10 @@ function Invoke-PreflightValidation {
                 Add-Check -Category 'Network' -Check 'Virtual network' -Status 'FAIL' `
                     -Detail "VNet '$VirtualNetworkName' not found in resource group '$VirtualNetworkResourceGroup'." `
                     -Recommendation 'Create the VNet first, or correct -VirtualNetworkName / -VirtualNetworkResourceGroup.' `
+                    -Scope $VirtualNetworkName
+                Add-SkippedChecks -Category 'Network' -Checks ($script:VnetDependentChecks + $script:SubnetDependentChecks) `
+                    -Reason "VNet '$VirtualNetworkName' was not found, so nothing below it could be read." `
+                    -Recommendation 'Re-run once the VNet exists to validate DNS, IP capacity, routing and NSG egress.' `
                     -Scope $VirtualNetworkName
                 return
             }
@@ -1345,6 +1381,10 @@ function Invoke-PreflightValidation {
             if ([string]::IsNullOrWhiteSpace($SubnetName)) {
                 Add-Check -Category 'Network' -Check 'Session host subnet' -Status 'SKIP' `
                     -Detail 'No -SubnetName supplied.' -Scope $VirtualNetworkName
+                Add-SkippedChecks -Category 'Network' -Checks $script:SubnetDependentChecks `
+                    -Reason 'no -SubnetName was supplied.' `
+                    -Recommendation 'Supply -SubnetName to evaluate IP capacity, delegation, egress path and NSG rules.' `
+                    -Scope $VirtualNetworkName
                 return
             }
 
@@ -1354,6 +1394,10 @@ function Invoke-PreflightValidation {
                 Add-Check -Category 'Network' -Check 'Session host subnet' -Status 'FAIL' `
                     -Detail "Subnet '$SubnetName' not found in VNet '$VirtualNetworkName'." `
                     -Recommendation 'Create the subnet or correct -SubnetName.' -Scope $VirtualNetworkName
+                Add-SkippedChecks -Category 'Network' -Checks $script:SubnetDependentChecks `
+                    -Reason "subnet '$SubnetName' was not found in the VNet." `
+                    -Recommendation 'Re-run once the subnet exists to validate IP capacity, delegation, egress path and NSG rules.' `
+                    -Scope $VirtualNetworkName
                 return
             }
 
