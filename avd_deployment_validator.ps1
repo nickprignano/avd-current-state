@@ -1012,9 +1012,37 @@ function Invoke-PreflightValidation {
                     Add-Check -Category 'Capacity' -Check 'vCPU quota (family)' -Status 'PASS' `
                         -Detail "$script:PlannedVmFamily : $available of $limit vCPUs free, $requiredVcpus required."
                 } else {
+                    $shortfall = $requiredVcpus - $available
+                    $zeroNote = ''
+                    if ($limit -eq 0) { $zeroNote = ' This family has no quota allocated at all in this region, which is common on trial and MSDN subscriptions.' }
                     Add-Check -Category 'Capacity' -Check 'vCPU quota (family)' -Status 'FAIL' `
                         -Detail "$script:PlannedVmFamily : only $available of $limit vCPUs free, $requiredVcpus required for $SessionHostCount host(s)." `
-                        -Recommendation "Request a quota increase of at least $($requiredVcpus - $available) vCPUs for $script:PlannedVmFamily in $Location."
+                        -Recommendation "Request an increase of at least $shortfall vCPUs for $script:PlannedVmFamily in $Location, or move to a family that already has headroom.$zeroNote"
+
+                    # Requesting quota takes days. Switching to a family that already has
+                    # headroom takes one parameter, so name the candidates.
+                    $alternatives = @($usages |
+                        Where-Object {
+                            $usageName = "$(Get-Prop (Get-Prop $_ 'Name') 'Value' '')"
+                            $usageName -like '*Family' -and $usageName -ne $script:PlannedVmFamily -and
+                            ([int](Get-Prop $_ 'Limit' 0) - [int](Get-Prop $_ 'CurrentValue' 0)) -ge $requiredVcpus
+                        } |
+                        Sort-Object { [int](Get-Prop $_ 'Limit' 0) - [int](Get-Prop $_ 'CurrentValue' 0) } -Descending |
+                        Select-Object -First 8 |
+                        ForEach-Object {
+                            "{0} ({1} free)" -f (Get-Prop (Get-Prop $_ 'Name') 'Value' ''),
+                                               ([int](Get-Prop $_ 'Limit' 0) - [int](Get-Prop $_ 'CurrentValue' 0))
+                        })
+
+                    if ($alternatives.Count -gt 0) {
+                        Add-Check -Category 'Capacity' -Check 'Families with headroom' -Status 'INFO' `
+                            -Detail "Families already holding $requiredVcpus or more free vCPUs in ${Location}: $($alternatives -join '; ')." `
+                            -Recommendation 'Re-run with -SessionHostVmSize set to a size in one of these families to avoid waiting on a quota request. Confirm the size is offered in the region: the SKU check above validates that.'
+                    } else {
+                        Add-Check -Category 'Capacity' -Check 'Families with headroom' -Status 'WARN' `
+                            -Detail "No VM family in '$Location' currently holds $requiredVcpus free vCPUs." `
+                            -Recommendation 'A quota increase request is unavoidable for this host count, or reduce -SessionHostCount.'
+                    }
                 }
             }
 
@@ -1029,6 +1057,13 @@ function Invoke-PreflightValidation {
                 if ($available -ge $requiredVcpus) {
                     Add-Check -Category 'Capacity' -Check 'vCPU quota (regional)' -Status 'PASS' `
                         -Detail "Total regional vCPUs: $available of $limit free, $requiredVcpus required."
+                    # Fitting today is not the same as being able to grow.
+                    $headroomAfter = $available - $requiredVcpus
+                    if ($headroomAfter -lt $script:PlannedVcpuPerHost) {
+                        Add-Check -Category 'Capacity' -Check 'Scale-out headroom' -Status 'WARN' `
+                            -Detail "Only $headroomAfter regional vCPU(s) remain after this deployment, less than the $script:PlannedVcpuPerHost needed for one more host." `
+                            -Recommendation 'The deployment fits but cannot grow. Raise the Total Regional vCPUs quota before you need to add capacity, and note that reimaging a host can temporarily need double.'
+                    }
                 } else {
                     Add-Check -Category 'Capacity' -Check 'vCPU quota (regional)' -Status 'FAIL' `
                         -Detail "Total regional vCPUs: only $available of $limit free, $requiredVcpus required." `
